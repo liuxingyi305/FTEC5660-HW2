@@ -83,8 +83,20 @@ def build_agent(tools: list[Any]) -> Any:
     from .env.
     """
     ### YOUR CODE HERE
-    _ = tools
-    return None
+    from langchain_deepseek import ChatDeepSeek
+    from langchain.agents import create_agent
+
+    model = ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+    )
+
+    agent = create_agent(
+        model,
+        tools,
+        prompt=system_prompt,
+    )
+    return agent
 
 
 async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
@@ -106,8 +118,68 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     shared by the whole class.
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+    import re as _re
+
+    sem = asyncio.Semaphore(3)
+
+    def _extract_score(text: str) -> float | None:
+        # 优先匹配 {"score": 0.9}
+        m = _re.search(r'\{\s*"score"\s*:\s*([01](?:\.\d+)?|0?\.\d+)\s*\}', text)
+        if m:
+            try:
+                val = float(m.group(1))
+                if 0.0 <= val <= 1.0:
+                    return val
+            except ValueError:
+                pass
+        # 退化匹配 "score": 0.9
+        m2 = _re.search(r'"score"\s*:\s*([01](?:\.\d+)?|0?\.\d+)', text)
+        if m2:
+            try:
+                val = float(m2.group(1))
+                if 0.0 <= val <= 1.0:
+                    return val
+            except ValueError:
+                pass
+        return None
+
+    async def _score_one(name: str, text: str) -> tuple[str, float]:
+        async with sem:
+            prompt = (
+                "Verify the following CV against the candidate's LinkedIn and Facebook profiles. "
+                "Use only the SocialGraph MCP tools. "
+                'Reply with a single JSON object only, e.g. {"score": 0.9}.\n\n'
+                f"CV file name: {name}\n"
+                "CV content:\n"
+                f"{text}"
+            )
+
+            for _attempt in range(3):
+                try:
+                    result = await agent.ainvoke(
+                        {"messages": [{"role": "user", "content": prompt}]}
+                    )
+                    messages = result.get("messages", []) if isinstance(result, dict) else []
+                    if not messages:
+                        raise ValueError("agent returned no messages")
+                    last = messages[-1]
+                    content = getattr(last, "content", last)
+                    if isinstance(content, list):
+                        content = " ".join(
+                            str(part.get("text", part)) if isinstance(part, dict) else str(part)
+                            for part in content
+                        )
+                    score = _extract_score(str(content))
+                    if score is not None:
+                        return name, score
+                except Exception:
+                    await asyncio.sleep(1.0)
+
+            # 多次失败时保守给 0.0，保证不崩溃
+            return name, 0.0
+
+    results = await asyncio.gather(*(_score_one(n, t) for n, t in cvs.items()))
+    return dict(results)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
