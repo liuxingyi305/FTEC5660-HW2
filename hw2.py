@@ -86,16 +86,62 @@ def build_agent(tools: list[Any]) -> Any:
     from langchain_deepseek import ChatDeepSeek
     from langchain.agents import create_agent
 
-    model = ChatDeepSeek(
-        model=MODEL_NAME,
-        temperature=0,
-    )
+    model = ChatDeepSeek(model=MODEL_NAME, temperature=0)
 
-    agent = create_agent(
-        model,
-        tools,
-        prompt=system_prompt,
-    )
+    system_prompt = """
+You are a rigorous KYC / CV verification agent. You may ONLY use the provided SocialGraph MCP tools. Never use web search or any other data source.
+
+Goal: decide whether the key claims in the CV are consistent with the candidate's LinkedIn and Facebook profiles. LinkedIn is the primary source; Facebook is used for cross-checking.
+
+FIELDS TO VERIFY (structured fields only):
+- name
+- city
+- jobs: company, title, seniority, start_year, end_year
+- education: degree, school, field, graduation year
+- skills
+
+NOT discrepancies:
+- wording differences: "Bachelor of Science" vs "BSc", "UI/UX Design" vs "UI/UX", "Senior Engineer" vs "Engineer"
+- the CV lists FEWER skills than LinkedIn
+- differences in job description, headline, or hometown
+
+DISCREPANCIES (any one is enough to fail the CV):
+- INFLATED JOB TITLE: the CV title implies HIGHER seniority than LinkedIn.
+  Compare BOTH the LinkedIn title AND the LinkedIn seniority field.
+  Examples that ARE discrepancies:
+    * CV "Senior Analyst" vs LinkedIn "Analyst" with seniority "junior"
+    * CV "Senior Engineer" vs LinkedIn "Engineer" with seniority "mid"
+    * CV "Manager" vs LinkedIn "Analyst"
+  Rule: if the CV title adds words like Senior / Lead / Head / Manager / Director / Principal
+  that are NOT supported by the LinkedIn title or seniority, it is an inflated title -> discrepancy.
+  Only ignore wording when seniority is the SAME, e.g. CV "BSc" vs LinkedIn "Bachelor of Science".
+- employment or graduation YEARS that differ by even one year (e.g. CV 2015 vs LinkedIn 2014)
+- an upgraded degree (e.g. CV says MSc, LinkedIn says BSc)
+- a fake school or employer
+- a wrong location
+- a skill listed on the CV that is NOT in the LinkedIn skills list (e.g. CV lists Docker, LinkedIn has no Docker)
+
+PROCEDURE (do this step by step, do not skip):
+1. Extract from the CV: full name, city, every job (company, title, start_year, end_year), every education entry (school, degree, field, graduation year), every skill.
+2. Search LinkedIn with the name and location. If several people match, prefer the one whose company / school / years match. Call get_linkedin_profile on the right person_id.
+3. Compare each field one by one:
+   - name: exact or clearly same person
+   - city: exact
+   - each job: company exact, title consistent (ignore mere wording), start_year EXACT, end_year EXACT
+   - each education: school exact, degree consistent, field consistent, graduation year EXACT
+   - each skill listed on the CV: MUST appear on LinkedIn skills (wording-only variants OK)
+4. Cross-check with Facebook (search by display name, then get_facebook_profile).
+5. Decide:
+   - If ANY structured field conflicts (year, company, school, degree, location, extra skill): score in [0.0, 0.2]
+   - If everything matches (or only wording/fewer-skills differences): score in [0.8, 1.0]
+   - If genuinely uncertain because the person cannot be identified: score around 0.5
+
+Your FINAL answer MUST be a single JSON object with a short reason, e.g.:
+{"reason": "CV says start_year 2015, LinkedIn says 2014", "score": 0.1}
+Nothing else after the JSON.
+"""
+
+    agent = create_agent(model, tools, system_prompt=system_prompt)
     return agent
 
 
@@ -122,8 +168,7 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
 
     sem = asyncio.Semaphore(3)
 
-    def _extract_score(text: str) -> float | None:
-        # 优先匹配 {"score": 0.9}
+    def _extract_score(text):
         m = _re.search(r'\{\s*"score"\s*:\s*([01](?:\.\d+)?|0?\.\d+)\s*\}', text)
         if m:
             try:
@@ -132,7 +177,6 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
                     return val
             except ValueError:
                 pass
-        # 退化匹配 "score": 0.9
         m2 = _re.search(r'"score"\s*:\s*([01](?:\.\d+)?|0?\.\d+)', text)
         if m2:
             try:
@@ -143,25 +187,20 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
                 pass
         return None
 
-    async def _score_one(name: str, text: str) -> tuple[str, float]:
+    async def _score_one(name, text):
         async with sem:
             prompt = (
                 "Verify the following CV against the candidate's LinkedIn and Facebook profiles. "
                 "Use only the SocialGraph MCP tools. "
                 'Reply with a single JSON object only, e.g. {"score": 0.9}.\n\n'
-                f"CV file name: {name}\n"
-                "CV content:\n"
-                f"{text}"
+                f"CV file name: {name}\nCV content:\n{text}"
             )
-
             for _attempt in range(3):
                 try:
-                    result = await agent.ainvoke(
-                        {"messages": [{"role": "user", "content": prompt}]}
-                    )
+                    result = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]})
                     messages = result.get("messages", []) if isinstance(result, dict) else []
                     if not messages:
-                        raise ValueError("agent returned no messages")
+                        raise ValueError("no messages")
                     last = messages[-1]
                     content = getattr(last, "content", last)
                     if isinstance(content, list):
@@ -174,8 +213,6 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
                         return name, score
                 except Exception:
                     await asyncio.sleep(1.0)
-
-            # 多次失败时保守给 0.0，保证不崩溃
             return name, 0.0
 
     results = await asyncio.gather(*(_score_one(n, t) for n, t in cvs.items()))
